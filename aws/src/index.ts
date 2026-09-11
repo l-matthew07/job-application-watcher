@@ -84,15 +84,27 @@ function companyFromUrl(url: string): string {
 
 // Alert-dedupe key: companies (Amazon especially) post the same role under
 // several job ids and repost under fresh ids later. One title = one alert.
-function titleKey(companyName: string, title: string): string {
+export function titleKey(companyName: string, title: string): string {
   return `${companyName}:${title.toLowerCase().replace(/\s+/g, " ").trim()}`;
 }
 
-async function getBody(url: string, accept?: string): Promise<string | null> {
+// The watcher runs on a 120s Lambda timeout and can afford to wait out a slow
+// board. The admin page cannot: it sits behind API Gateway, whose integration
+// timeout is a hard 30s maximum, and a request that exceeds it comes back as a
+// bare {"message":"Service Unavailable"} with no detail. Detection therefore
+// uses DETECT_TIMEOUT_MS, not this.
+const FETCH_TIMEOUT_MS = 25_000;
+const DETECT_TIMEOUT_MS = 6_000;
+
+async function getBody(
+  url: string,
+  accept?: string,
+  timeoutMs: number = FETCH_TIMEOUT_MS,
+): Promise<string | null> {
   try {
     const resp = await fetch(url, {
       headers: { "User-Agent": UA, ...(accept ? { Accept: accept } : {}) },
-      signal: AbortSignal.timeout(25_000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if (!resp.ok) return null;
     return await resp.text();
@@ -101,8 +113,11 @@ async function getBody(url: string, accept?: string): Promise<string | null> {
   }
 }
 
-async function getJson(url: string): Promise<unknown | null> {
-  const body = await getBody(url, "application/json");
+async function getJson(
+  url: string,
+  timeoutMs: number = FETCH_TIMEOUT_MS,
+): Promise<unknown | null> {
+  const body = await getBody(url, "application/json", timeoutMs);
   if (body === null) return null;
   try {
     return JSON.parse(body);
@@ -113,9 +128,10 @@ async function getJson(url: string): Promise<unknown | null> {
 
 // --- Providers ---------------------------------------------------------------
 
-async function fetchAshbyApi(c: Company): Promise<Map<string, Job> | null> {
+async function fetchAshbyApi(c: Company, timeoutMs?: number): Promise<Map<string, Job> | null> {
   const data = (await getJson(
     `https://api.ashbyhq.com/posting-api/job-board/${encodeURIComponent(c.slug)}`,
+    timeoutMs,
   )) as { jobs?: { id: string; title: string; location?: string; jobUrl: string; applyUrl: string }[] } | null;
   if (!data) return null;
   return new Map((data.jobs ?? []).map(j => [j.id.toLowerCase(), {
@@ -131,8 +147,9 @@ async function fetchAshbyApi(c: Company): Promise<Map<string, Job> | null> {
 // Redundant second Ashby source: the board page server-renders the job list
 // as JSON in the HTML. If the posting API's cache ever lags, this is where a
 // new posting shows up first (it's what a human visiting the page sees).
-async function fetchAshbyPage(c: Company): Promise<Map<string, Job> | null> {
-  const html = await getBody(`https://jobs.ashbyhq.com/${encodeURIComponent(c.slug)}`);
+async function fetchAshbyPage(c: Company, timeoutMs?: number): Promise<Map<string, Job> | null> {
+  const html = await getBody(
+    `https://jobs.ashbyhq.com/${encodeURIComponent(c.slug)}`, undefined, timeoutMs);
   if (html === null) return null;
   const re = /\{"id":"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})","title":"((?:[^"\\]|\\.)*)"(?:[^{}]*?"locationName":"((?:[^"\\]|\\.)*)")?/gi;
   const jobs = new Map<string, Job>();
@@ -152,9 +169,10 @@ async function fetchAshbyPage(c: Company): Promise<Map<string, Job> | null> {
   return jobs.size > 0 ? jobs : null;
 }
 
-async function fetchGreenhouse(c: Company): Promise<Map<string, Job> | null> {
+async function fetchGreenhouse(c: Company, timeoutMs?: number): Promise<Map<string, Job> | null> {
   const data = (await getJson(
     `https://boards-api.greenhouse.io/v1/boards/${encodeURIComponent(c.slug)}/jobs`,
+    timeoutMs,
   )) as { jobs?: { id: number; title: string; absolute_url: string; location?: { name?: string } }[] } | null;
   if (!data) return null;
   return new Map((data.jobs ?? []).map(j => [`gh-${c.slug}-${j.id}`, {
@@ -167,9 +185,10 @@ async function fetchGreenhouse(c: Company): Promise<Map<string, Job> | null> {
   }]));
 }
 
-async function fetchLever(c: Company): Promise<Map<string, Job> | null> {
+async function fetchLever(c: Company, timeoutMs?: number): Promise<Map<string, Job> | null> {
   const data = (await getJson(
     `https://api.lever.co/v0/postings/${encodeURIComponent(c.slug)}?mode=json`,
+    timeoutMs,
   )) as { id: string; text: string; hostedUrl: string; applyUrl?: string; categories?: { location?: string } }[] | null;
   if (!data || !Array.isArray(data)) return null;
   return new Map(data.map(j => [`lv-${c.slug}-${j.id}`, {
@@ -182,9 +201,11 @@ async function fetchLever(c: Company): Promise<Map<string, Job> | null> {
   }]));
 }
 
-async function fetchCompanyBoard(c: Company): Promise<Board | null> {
+async function fetchCompanyBoard(c: Company, timeoutMs?: number): Promise<Board | null> {
   if (c.provider === "ashby") {
-    const [api, page] = await Promise.all([fetchAshbyApi(c), fetchAshbyPage(c)]);
+    const [api, page] = await Promise.all([
+      fetchAshbyApi(c, timeoutMs), fetchAshbyPage(c, timeoutMs),
+    ]);
     if (api === null && page === null) return null;
     // Union of both sources; API entries win (richer location/applyUrl).
     // "ok" (trust close detection) requires both to have answered.
@@ -193,7 +214,9 @@ async function fetchCompanyBoard(c: Company): Promise<Board | null> {
       ok: api !== null && page !== null,
     };
   }
-  const jobs = c.provider === "greenhouse" ? await fetchGreenhouse(c) : await fetchLever(c);
+  const jobs = c.provider === "greenhouse"
+    ? await fetchGreenhouse(c, timeoutMs)
+    : await fetchLever(c, timeoutMs);
   return jobs === null ? null : { jobs, ok: true };
 }
 
@@ -325,17 +348,56 @@ async function sendAlerts(alerts: string[]): Promise<void> {
   await sendText(recipients, alerts.join("\n\n"));
 }
 
-// When the admin page can't auto-detect a company, text the maintainer
-// (first RECIPIENTS number) so the provider can be built out manually.
-async function notifyAdmin(text: string): Promise<void> {
+// When the admin page can't auto-detect a company, the maintainer (first
+// RECIPIENTS number) gets told so the provider can be built out manually.
+//
+// The note is QUEUED, not sent. The admin page runs behind API Gateway's hard
+// 30s integration timeout, and booting Spectrum to send an iMessage is slow —
+// and when Photon is down it can hang straight past that cap, turning a
+// perfectly ordinary "couldn't find that company" into an opaque
+// {"message":"Service Unavailable"}. The scheduled watch run has a 120s budget
+// and no gateway in front of it, so it does the sending. The queue also means
+// the note survives Photon being broken, which is exactly when it is most
+// likely to be needed.
+function pendingParam(): string {
+  return process.env.PENDING_PARAM ?? "/apply-watcher/pending-admin";
+}
+
+const MAX_PENDING_NOTES = 20;
+
+async function loadPendingNotes(): Promise<string[]> {
+  try {
+    const list = JSON.parse((await loadParam(pendingParam())) ?? "[]");
+    return Array.isArray(list) ? list.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function queueAdminNote(text: string): Promise<void> {
+  try {
+    const pending = await loadPendingNotes();
+    pending.push(text);
+    await saveParam(
+      pendingParam(), JSON.stringify(pending.slice(-MAX_PENDING_NOTES)));
+  } catch (e) {
+    // A queue failure must not fail the admin request — the page still shows
+    // the reason on screen, which is the part the user is waiting for.
+    console.error(`queue admin note FAILED — ${e}`);
+  }
+}
+
+async function flushAdminNotes(): Promise<void> {
+  const pending = await loadPendingNotes();
+  if (pending.length === 0) return;
   const admin = (process.env.RECIPIENTS ?? "")
     .split(",").map(s => s.trim()).filter(Boolean)[0];
   if (!admin) return;
-  try {
-    await sendText([admin], text);
-  } catch (e) {
-    console.error(`admin notify FAILED — ${e}`);
-  }
+  // Only clear once the send actually returned. If Spectrum can't start, the
+  // notes stay queued for the next run rather than vanishing.
+  await sendText([admin], pending.join("\n\n"));
+  await saveParam(pendingParam(), "[]");
+  console.log(`flushed ${pending.length} queued admin note(s)`);
 }
 
 // --- Watcher -----------------------------------------------------------------
@@ -481,6 +543,12 @@ async function runWatch(): Promise<Record<string, Status>> {
     await emailAlerts(alerts);
     await sendAlerts(alerts);
   }
+  try {
+    await flushAdminNotes();
+  } catch (e) {
+    // Photon being down must not fail the watch run — the notes stay queued.
+    console.error(`flush admin notes FAILED — ${e}`);
+  }
   await saveParam(param, JSON.stringify(state));
   console.log(JSON.stringify(results));
   return results;
@@ -494,14 +562,42 @@ function esc(s: string): string {
 }
 
 async function probe(c: Company): Promise<number | null> {
-  const board = await fetchCompanyBoard(c);
+  const board = await fetchCompanyBoard(c, DETECT_TIMEOUT_MS);
   return board === null ? null : board.jobs.size;
+}
+
+// A company name is rarely its board slug. DoorDash's Greenhouse board is
+// "doordashusa", not "doordash" — and a user typing a company name has no
+// reason to know that. Probing a few common variants turns a dead end into a
+// hit. Exact matches still win over variants when both respond, so a real
+// "acme" board is never shadowed by someone else's "acmeinc".
+const CORPORATE_SUFFIXES = new Set(["inc", "llc", "corp", "co", "ltd", "plc", "gmbh"]);
+
+export function slugCandidates(input: string): string[] {
+  // Separators become hyphens rather than being deleted: dropping them turns
+  // "Foo-Bar, Inc." into "foo-barinc", gluing the suffix onto the name.
+  const words = input
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+  // A trailing "Inc"/"Ltd" is almost never part of the board slug.
+  while (words.length > 1 && CORPORATE_SUFFIXES.has(words[words.length - 1]!)) {
+    words.pop();
+  }
+  const base = words.join("-");
+  const compact = words.join("");
+  // No alphanumerics at all means there is nothing to guess from. Returning
+  // the bare suffixes here would probe boards literally named "usa" or "inc"
+  // and could match an unrelated company.
+  if (!compact) return [];
+  const variants = [base, compact, `${compact}usa`, `${compact}inc`, `${compact}careers`];
+  return [...new Set(variants.filter(Boolean))];
 }
 
 // Figure out which ATS a company input refers to. Accepts a board/careers
 // URL (ashbyhq.com/x, greenhouse.io/x, lever.co/x) or a bare company name,
 // which is probed against all three providers.
-async function detectCompany(
+export async function detectCompany(
   input: string,
 ): Promise<{ company: Company; count: number } | { error: string }> {
   const s = input.trim();
@@ -523,21 +619,33 @@ async function detectCompany(
   if (/[\/:]/.test(s)) {
     return { error: "That URL isn't an Ashby, Greenhouse, or Lever board. Find the company's actual job board link (often behind the Apply button) and paste that." };
   }
-  const slug = s.toLowerCase().replace(/[^a-z0-9-]/g, "");
   const name = s.charAt(0).toUpperCase() + s.slice(1);
   const providers: Provider[] = ["ashby", "greenhouse", "lever"];
-  const counts = await Promise.all(
-    providers.map(p => probe({ name, provider: p, slug })),
+  const candidates = slugCandidates(s);
+  if (candidates.length === 0) {
+    return { error: "Enter a company name or careers URL." };
+  }
+  // Every provider x slug combination at once. These are independent HTTP
+  // reads on a short timeout, so the whole sweep costs one round trip, not N.
+  const attempts = candidates.flatMap(slug =>
+    providers.map(provider => ({ slug, provider })),
   );
-  const hits = providers
-    .map((p, i) => ({ provider: p, count: counts[i] }))
-    .filter((h): h is { provider: Provider; count: number } => h.count !== null)
-    .sort((a, b) => b.count - a.count);
+  const counts = await Promise.all(
+    attempts.map(a => probe({ name, provider: a.provider, slug: a.slug })),
+  );
+  const hits = attempts
+    .map((a, i) => ({ ...a, count: counts[i], exact: a.slug === candidates[0] }))
+    .filter((h): h is typeof h & { count: number } => h.count !== null && h.count > 0)
+    // Exact slug first, then the fullest board.
+    .sort((a, b) => Number(b.exact) - Number(a.exact) || b.count - a.count);
   if (hits.length === 0) {
-    return { error: `No Ashby, Greenhouse, or Lever board found for "${slug}". Try pasting the company's job-board URL instead.` };
+    return { error: `No Ashby, Greenhouse, or Lever board found for "${candidates[0]}" (also tried ${candidates.slice(1).join(", ")}). Try pasting the company's job-board URL instead.` };
   }
   const best = hits[0]!;
-  return { company: { name, provider: best.provider, slug }, count: best.count };
+  return {
+    company: { name, provider: best.provider, slug: best.slug },
+    count: best.count,
+  };
 }
 
 function adminPage(companies: Company[], message: string): string {
@@ -606,14 +714,14 @@ async function handleHttp(event: HttpEvent): Promise<object> {
     if (form.get("action") === "add") {
       const res = await detectCompany(form.get("company") ?? "");
       if ("error" in res) {
-        await notifyAdmin(
+        await queueAdminNote(
           `🛠️ Apply-watcher: a company couldn't be added via the admin page.\n` +
           `Input: "${(form.get("company") ?? "").trim().slice(0, 200)}"\n` +
           `Reason: ${res.error}\n` +
           `Needs a manual provider build-out.`,
         );
-        message = `⚠️ ${esc(res.error)}<br>Matthew's been texted and will wire ` +
-          `this one up manually.`;
+        message = `⚠️ ${esc(res.error)}<br>Matthew will be texted on the next ` +
+          `run (within 5 minutes) and will wire this one up manually.`;
       } else if (
         [NOTION.name, "Amazon", ...companies.map(c => c.name)]
           .some(n => n.toLowerCase() === res.company.name.toLowerCase())
@@ -622,9 +730,9 @@ async function handleHttp(event: HttpEvent): Promise<object> {
       } else {
         companies.push(res.company);
         await saveParam(companiesParam(), JSON.stringify(companies));
-        message = `✅ Added ${esc(res.company.name)} (${res.company.provider}, ` +
-          `${res.count} postings live). The watcher picks it up within 5 minutes ` +
-          `and texts if anything matches.`;
+        message = `✅ Added ${esc(res.company.name)} — ${res.company.provider} ` +
+          `board "${esc(res.company.slug)}", ${res.count} postings live. The ` +
+          `watcher picks it up within 5 minutes and texts if anything matches.`;
         // Success confirmation goes to the alert email (Sudo). Failures
         // deliberately do NOT go to him — only the maintainer is texted.
         await emailAlerts([

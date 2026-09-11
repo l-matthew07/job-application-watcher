@@ -83,9 +83,13 @@ else
     --environment "$ENV_JSON" --timeout 120 >/dev/null
 fi
 aws lambda wait function-updated --function-name "$FUNC"
-# Cost guardrails: never more than one concurrent run; logs expire.
+# Cost guardrail: bounded concurrency, and logs expire.
+# Not 1 — the same function serves both the EventBridge schedule and the admin
+# page, so a watch run in flight would throttle an admin request, and API
+# Gateway surfaces a throttled Lambda as a bare 503 "Service Unavailable".
+# 5 keeps the runaway-cost ceiling while leaving room for the page.
 aws lambda put-function-concurrency --function-name "$FUNC" \
-  --reserved-concurrent-executions 1 >/dev/null
+  --reserved-concurrent-executions 5 >/dev/null
 aws logs put-retention-policy --log-group-name "/aws/lambda/$FUNC" \
   --retention-in-days 14 2>/dev/null || true
 echo "Lambda $FUNC deployed."
