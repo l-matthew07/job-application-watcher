@@ -17,3 +17,5 @@ sentiment.jsonl
 sentiment_state.json
 companies.yaml
 .pytest_cache/
+infra/build/
+.aws-sam/

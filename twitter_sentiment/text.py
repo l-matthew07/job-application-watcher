@@ -15,6 +15,7 @@ keeps the sentiment numbers meaning anything.
 
 from __future__ import annotations
 
+import hashlib
 import html
 import re
 import unicodedata
@@ -79,13 +80,31 @@ def clean_for_sentiment(text: str) -> str:
     return WHITESPACE_RE.sub(" ", cleaned).strip()
 
 
+# 8 bytes of BLAKE2b. Dedupe keys are stored in bulk — a few thousand per
+# company — so they are hashed rather than kept as normalized text: the raw
+# form averages ~200 chars, which puts a 5k ring past DynamoDB's 400KB item
+# limit on its own. At 16 hex chars a collision needs ~5 billion distinct
+# posts per company to become likely, and the cost of one is a single dropped
+# post, not corruption.
+DEDUPE_DIGEST_BYTES = 8
+
+
 def dedupe_key(text: str) -> str:
     """Fingerprint for near-identical copypasta (same words, different links).
 
-    Case, punctuation, URLs, handles and whitespace are discarded, so the two
-    halves of a quote-tweet chain collapse onto one key.
+    Case, punctuation, URLs, handles and whitespace are discarded before
+    hashing, so the two halves of a quote-tweet chain collapse onto one key.
+    Empty text has no fingerprint and returns "" rather than the hash of the
+    empty string — callers treat "" as "not dedupable".
     """
-    return NON_ALNUM_RE.sub("", strip_accents(clean_for_sentiment(text)).lower())
+    normalized = NON_ALNUM_RE.sub(
+        "", strip_accents(clean_for_sentiment(text)).lower()
+    )
+    if not normalized:
+        return ""
+    return hashlib.blake2b(
+        normalized.encode("utf-8"), digest_size=DEDUPE_DIGEST_BYTES
+    ).hexdigest()
 
 
 def _term_pattern(term: str) -> re.Pattern[str]:
