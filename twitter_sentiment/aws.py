@@ -118,8 +118,13 @@ class S3ResultStore:
         return written
 
     def read_all(self, company: str | None = None) -> list[dict]:
-        """Read every record back. For debugging and tests — at real volume
-        query the bucket with Athena instead of pulling it through here."""
+        """Read every record back, ordered by S3 key.
+
+        For debugging and tests — at real volume, query the bucket with Athena
+        instead of pulling it through here. Key order is chronological across
+        runs, but within a single second the tiebreak is the random ``run_id``,
+        so don't read anything into the order of two near-simultaneous runs.
+        """
         prefix = self.prefix
         if company:
             prefix = f"{prefix}/company={self.partition_name(company)}/"

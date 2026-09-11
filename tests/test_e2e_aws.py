@@ -197,8 +197,13 @@ def test_consecutive_runs_resume_and_never_re_emit(deployed, monkeypatch):
     ])
 
     records = S3ResultStore(BUCKET).read_all()
+    ids = [r["id"] for r in records]
     assert len(records) == after_first + 1
-    assert records[-1]["id"] == "2000"
+    # Membership, not position: read_all orders by S3 key, whose tiebreak
+    # inside one second is the random run_id. Runs minutes apart sort
+    # chronologically; two invocations in the same test second do not.
+    assert "2000" in ids
+    assert ids.count("2001") == 0   # copypasta, caught by the fingerprint ring
     assert DynamoRunState(TABLE).since_id("Tesla") == "2001"
 
 
