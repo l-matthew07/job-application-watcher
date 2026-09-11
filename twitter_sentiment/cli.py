@@ -150,7 +150,9 @@ def _print_human(run: CompanyRun, examples: int, stream) -> None:
     print(file=stream)
 
 
-def main(argv=None, stream=None) -> int:
+def main(argv=None, stream=None, transport=None) -> int:
+    """Run a scrape. ``transport`` is an injection seam for end-to-end tests;
+    left as None it means the real HTTP transport."""
     load_dotenv()
     stream = stream or sys.stdout
     args = build_parser().parse_args(argv)
@@ -175,7 +177,7 @@ def main(argv=None, stream=None) -> int:
     scorer = SentimentScorer(
         extra_lexicon=config.extra_lexicon, extra_phrases=config.extra_phrases
     )
-    client = XSearchClient(token)
+    client = XSearchClient(token, transport=transport)
     store = ResultStore(config.output_path)
     state = RunState(config.state_path)
     if args.fresh:

@@ -136,6 +136,111 @@ compliance checklist that scale requires. **Currently parked as the
 phase-2 path** — distribution happens via social for now, and this stack
 gets picked back up when signup opens to the public.
 
+## Company sentiment on X (`twitter_sentiment/`)
+
+Unrelated to the apply-button watchers above: a scraper that pulls recent
+public posts about a list of companies from X, filters out the noise, scores
+what's left for sentiment, and rolls it up per company.
+
+```bash
+pip install -r requirements.txt
+cp companies.example.yaml companies.yaml   # edit the company list
+echo 'X_BEARER_TOKEN=...' >> .env
+
+python -m twitter_sentiment --config companies.yaml --dry-run   # inspect queries
+python -m twitter_sentiment --config companies.yaml             # run it
+python -m twitter_sentiment --company Rivian --term rivian --term '$RIVN'
+```
+
+```
+Tesla: 4 posts | +1 ~1 -2 | net -0.25 | mean -0.151 (engagement-weighted -0.108)
+  fetched 9, kept 4 (promo_spam=1, no_term_match=1, unsupported_lang=1, too_short=1)
+  most positive +0.84  Tesla's new FSD build is genuinely excellent, best update yet
+  most negative -0.81  third Tesla service center outage this week, absolutely terrible
+```
+
+Add `--json` for a machine-readable version of the same thing.
+
+### Why the API and not HTML scraping
+
+This reads `GET /2/tweets/search/recent` with an app-only bearer token.
+Scraping x.com unauthenticated violates X's terms of service, and in practice
+means guest-token acquisition, aggressive IP blocking and markup that rotates
+without notice. The `Transport` protocol in `client.py` is the seam if a
+different backend is ever needed — the rest of the pipeline doesn't care.
+
+Two consequences worth knowing before you plan around this:
+
+- **Recent search only covers the last 7 days.** There is no backfill here; to
+  build history you run it on a schedule and let `sentiment.jsonl` accumulate.
+- **Recent search requires a paid access tier.** The free tier does not include
+  it. Check current pricing at <https://docs.x.com/x-api> — it has changed
+  repeatedly.
+
+### How a post becomes a number
+
+| Stage | What it does |
+|-------|--------------|
+| **Query** | `terms` OR'd together, `exclude_terms` negated, plus `-is:retweet` / `lang:` |
+| **Relevance** | Terms re-checked locally with word boundaries — the API tokenizes loosely, so `Teslamania` comes back for a `tesla` query and has to be dropped here |
+| **Quality** | Promo spam, hashtag/mention stuffing, one-word posts, and brand-new low-follower accounts |
+| **Dedupe** | Copypasta collapsed by a text fingerprint that ignores links, handles and punctuation |
+| **Score** | VADER plus a domain lexicon (see below) |
+| **Rollup** | Counts, plain mean, engagement-weighted mean, strongest examples each way |
+
+Every drop is counted by reason and printed. That's deliberate — the way a
+scraper like this fails is silently: a query stops matching, volume goes to
+zero, and the sentiment number looks calm rather than broken.
+
+### Sentiment
+
+[VADER](https://github.com/cjhutto/vaderSentiment) is the base — it was built
+for social text, so emoji, ALL-CAPS, `!!!`, degree modifiers and negation all
+work with no training step. What it doesn't have is the vocabulary people use
+about *companies*: stock VADER scores "layoffs announced today" at a flat
+`0.0`, along with `outage`, `bricked`, `buggy` and `overpriced`.
+`sentiment.py` adds those, plus multi-word terms like `data breach`, which
+VADER can't express at all since it scores whitespace tokens.
+
+You can extend both from your config:
+
+```yaml
+extra_lexicon:                 # single words, VADER's -4.0..+4.0 scale
+  vaporware: -2.5
+extra_phrases:                 # multi-word terms
+  supply chain delay: -2.0
+```
+
+Limits, in rough order of how much they'll bite:
+
+- **Sarcasm is unsolved.** "great, another outage" scores positive. No lexicon
+  method fixes this.
+- **English only.** Other languages are skipped and counted as
+  `unsupported_lang` rather than scored 0.0 — a flat zero is indistinguishable
+  from real neutrality and would drag every rollup toward the middle.
+- **Polarity is not aboutness.** A post can be angry at a replier while
+  mentioning the company neutrally.
+
+### Incremental runs
+
+State lives in `sentiment_state.json`: a per-company `since_id` high-water
+mark, plus a bounded ring of recent text fingerprints. `since_id` works
+because X IDs are snowflakes, so the largest one seen means "everything before
+this is handled". The fingerprint ring covers what `since_id` can't — the same
+copypasta reposted under a new ID. Results append to `sentiment.jsonl`, one
+scored post per line. `--fresh` ignores the high-water mark and re-scans.
+
+### Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests/
+```
+
+No network: the HTTP transport is faked, everything below it is the real code
+path. `tests/test_e2e.py` drives the actual CLI through config parsing,
+filtering, scoring, JSONL output and resume-across-runs.
+
 ## Notes / limitations
 
 - This only detects a DOM-level "Apply" link becoming active. If Google changes the markup or blocks automated requests (e.g., CAPTCHA), the watchers log a `missing` status rather than crash, but won't know a role opened until the selector is updated.
