@@ -15,7 +15,7 @@ from .client import XSearchClient
 from .config import CompanyConfig
 from .models import Author, CompanySentiment, ScoredPost, posts_from_response
 from .sentiment import SentimentScorer
-from .store import RunState, id_max
+from .store import StateStore, id_max
 from .text import dedupe_key, find_terms, is_low_quality
 
 
@@ -45,7 +45,7 @@ def run_company(
     client: XSearchClient,
     scorer: SentimentScorer,
     company: CompanyConfig,
-    state: RunState | None = None,
+    state: StateStore | None = None,
     now=None,
 ) -> CompanyRun:
     """Scrape, filter and score one company. Never raises on empty results."""

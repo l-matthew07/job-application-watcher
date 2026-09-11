@@ -1,2 +1,4 @@
 -r requirements.txt
 pytest>=8.0
+boto3>=1.34
+moto[s3,dynamodb,secretsmanager,ssm]>=5.0

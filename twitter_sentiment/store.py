@@ -22,12 +22,48 @@ import os
 import tempfile
 from collections import deque
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Protocol, runtime_checkable
 
 # Recent dedupe keys kept per company. ~5k covers several days of a busy
 # company at a few hundred KB of state; beyond that, older copypasta
 # resurfacing is rare enough not to be worth the file size.
 DEFAULT_SEEN_LIMIT = 5000
+
+
+@runtime_checkable
+class ResultSink(Protocol):
+    """Where scored posts go. Local JSONL and S3 both satisfy this."""
+
+    def append(self, records: Iterable[dict]) -> int:
+        """Persist these records; returns how many were written."""
+
+
+@runtime_checkable
+class StateStore(Protocol):
+    """Per-company scrape bookkeeping. Local JSON and DynamoDB both satisfy this.
+
+    The contract is deliberately small so the pipeline never learns which
+    backend it has: read a high-water mark, move it forward, ask whether a
+    fingerprint has been seen, record one, and flush.
+    """
+
+    def since_id(self, company: str) -> str | None:
+        """Highest post ID already handled for this company, if any."""
+
+    def advance(self, company: str, newest_id: str | None) -> None:
+        """Move the high-water mark forward. Must never move it backward."""
+
+    def is_duplicate(self, company: str, dedupe_key: str) -> bool:
+        """True if this fingerprint was recorded recently."""
+
+    def remember(self, company: str, dedupe_key: str) -> None:
+        """Record a fingerprint as seen."""
+
+    def reset(self, company: str) -> None:
+        """Forget the high-water mark, keeping the fingerprint history."""
+
+    def save(self) -> None:
+        """Flush any buffered changes to the backing store."""
 
 
 def _atomic_write(path: Path, text: str) -> None:
