@@ -13,3 +13,7 @@ aws/.env
 aws/function.zip
 aws/dist/
 aws/bun.lock
+sentiment.jsonl
+sentiment_state.json
+companies.yaml
+.pytest_cache/
