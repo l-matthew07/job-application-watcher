@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Company sentiment scraper: scheduled Lambda -> X API v2 recent search ->
+  scored posts in S3 (partitioned JSONL), scrape state in DynamoDB,
+  per-company metrics in CloudWatch.
+
+Parameters:
+  Schedule:
+    Type: String
+    Default: rate(30 minutes)
+    Description: >
+      How often to scrape. Recent search only covers 7 days, so anything
+      under that keeps full coverage — the real constraint is your X API
+      quota, which every invocation spends. 30 minutes is a deliberate
+      default, not a floor.
+  BearerTokenSecretArn:
+    Type: String
+    Description: >
+      ARN of an existing Secrets Manager secret holding the X bearer token
+      (raw string, or JSON with an X_BEARER_TOKEN field). Deliberately not a
+      template parameter holding the token itself — a NoEcho parameter still
+      travels through CloudFormation and sits in the stack's parameter list.
+      deploy.sh creates this secret for you on a first deploy.
+  ConfigS3Uri:
+    Type: String
+    Default: ''
+    Description: >
+      Optional s3://bucket/key of the companies YAML. Set this to change the
+      watched companies without redeploying. Empty means use the copy baked
+      into the deployment package.
+  ResultsPrefix:
+    Type: String
+    Default: raw
+    Description: >
+      Key prefix for scored posts in the bucket. Feeds both the function's
+      RESULTS_PREFIX and the lifecycle rule, so the two cannot drift apart —
+      a prefix the lifecycle rule doesn't match would never age out.
+  MetricsNamespace:
+    Type: String
+    Default: TwitterSentiment
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Optional address to subscribe to the alarm topic.
+  RawRetentionDays:
+    Type: Number
+    Default: 365
+    Description: Days to keep scored posts in S3 before expiry.
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+
+Conditions:
+  HasConfigUri: !Not [!Equals [!Ref ConfigS3Uri, '']]
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 300
+    MemorySize: 512
+
+Resources:
+  # --- Storage -------------------------------------------------------------
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    # Retain: the scored-post history is the actual product of this stack and
+    # is not reconstructable — recent search only reaches back 7 days, so a
+    # deleted bucket is permanently lost data, not a re-run.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      LifecycleConfiguration:
+        Rules:
+          - Id: age-out-raw-posts
+            Status: Enabled
+            Prefix: !Sub ${ResultsPrefix}/
+            Transitions:
+              - {StorageClass: STANDARD_IA, TransitionInDays: 30}
+            ExpirationInDays: !Ref RawRetentionDays
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 7}
+
+  StateTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # pk/sk on-demand, matching the single-table convention platform/ uses.
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  # --- Failure handling ----------------------------------------------------
+  ScraperDLQ:
+    Type: AWS::SQS::Queue
+    # Delete with the stack: a DLQ message is only meaningful next to the
+    # function that produced it, so an orphaned queue is cost, not evidence.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      MessageRetentionPeriod: 1209600   # 14 days to inspect a failed run
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  # --- The scraper ---------------------------------------------------------
+  ScraperFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: build/
+      Handler: twitter_sentiment.handler.lambda_handler
+      Description: Scrape X for company mentions and score them for sentiment
+      # One run at a time. Two concurrent runs would race the DynamoDB
+      # read-modify-write on the same company and lose one's dedupe ring.
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !Ref ResultsBucket
+          STATE_TABLE: !Ref StateTable
+          RESULTS_PREFIX: !Ref ResultsPrefix
+          X_BEARER_SECRET_ID: !Ref BearerTokenSecretArn
+          METRICS_NAMESPACE: !Ref MetricsNamespace
+          CONFIG_S3_URI: !If [HasConfigUri, !Ref ConfigS3Uri, !Ref 'AWS::NoValue']
+      Events:
+        Scheduled:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref Schedule
+            Description: Scheduled company-sentiment scrape
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt ScraperDLQ.Arn
+      Policies:
+        - S3CrudPolicy: {BucketName: !Ref ResultsBucket}
+        - DynamoDBCrudPolicy: {TableName: !Ref StateTable}
+        - SQSSendMessagePolicy: {QueueName: !GetAtt ScraperDLQ.QueueName}
+        - Statement:
+            Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref BearerTokenSecretArn
+
+  ScraperInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref ScraperFunction
+      Qualifier: $LATEST
+      # Two retries, then the DLQ. A rate-limit failure won't clear inside a
+      # retry window, and the next scheduled run picks up from since_id anyway.
+      MaximumRetryAttempts: 2
+      MaximumEventAgeInSeconds: 3600
+
+  ScraperLogGroup:
+    Type: AWS::Logs::LogGroup
+    # Logs age out on their own via RetentionInDays; tearing the stack down
+    # should not leave a log group behind accruing charges.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ScraperFunction}
+      RetentionInDays: !Ref LogRetentionDays
+
+  # --- Alarms --------------------------------------------------------------
+  ScraperErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The sentiment scraper is failing invocations
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref ScraperFunction}
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 2
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  DLQNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A scrape run exhausted its retries and landed in the DLQ
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt ScraperDLQ.QueueName}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  NoPostsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      # The failure mode this whole stack is most exposed to: the scraper runs
+      # green, the query quietly stops matching, and sentiment reads "calm"
+      # because nothing is arriving. Invocation errors never catch that — only
+      # watching for the absence of kept posts does.
+      AlarmDescription: >
+        No posts kept across any company for 6 hours — the query has probably
+        stopped matching, or the API access tier changed.
+      Namespace: !Ref MetricsNamespace
+      MetricName: PostsKept
+      Statistic: Sum
+      Period: 21600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      # breaching, not notBreaching: metrics stopping entirely is the exact
+      # symptom being watched for, so missing data must fire the alarm.
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlarmTopic]
+
+Outputs:
+  FunctionName:
+    Value: !Ref ScraperFunction
+    Description: aws logs tail /aws/lambda/<this> --follow
+  ResultsBucket:
+    Value: !Ref ResultsBucket
+    Description: Scored posts, as <prefix>/company=<name>/dt=<date>/*.jsonl
+  StateTable:
+    Value: !Ref StateTable
+    Description: since_id and dedupe state, keyed SENTIMENT#<company>/STATE
+  DLQUrl:
+    Value: !Ref ScraperDLQ
+    Description: Failed runs land here — the DLQNotEmptyAlarm watches it
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic
+    Description: Subscribe to this for scraper alarms

@@ -230,6 +230,63 @@ this is handled". The fingerprint ring covers what `since_id` can't — the same
 copypasta reposted under a new ID. Results append to `sentiment.jsonl`, one
 scored post per line. `--fresh` ignores the high-water mark and re-scans.
 
+### Running it on AWS (`infra/`)
+
+The CLI above is the local path. `infra/` is the deployed one: an
+EventBridge-scheduled Lambda writing to S3 and DynamoDB.
+
+```
+EventBridge (rate(30 min))
+      │
+      ▼
+  scraper Lambda ──► X API v2 recent search
+      │  │  │
+      │  │  └──► CloudWatch (EMF metrics per company + alarms ──► SNS)
+      │  └─────► DynamoDB   SENTIMENT#<company>/STATE — since_id + dedupe ring
+      └────────► S3         <prefix>/company=<name>/dt=<date>/*.jsonl
+      │
+      └─ on repeated failure ──► DLQ (14-day retention, alarmed)
+```
+
+```bash
+cp companies.example.yaml companies.yaml     # edit the company list
+cd infra
+X_BEARER_TOKEN=AAAA... ./deploy.sh           # first deploy creates the secret
+./deploy.sh                                  # later deploys reuse it
+```
+
+`deploy.sh` is idempotent. It stages the package, puts the token in Secrets
+Manager, runs `sam validate --lint` and `sam build`, deploys, then invokes once
+as a smoke test. Knobs: `STACK_NAME`, `SCHEDULE`, `ALARM_EMAIL`,
+`COMPANIES_FILE`.
+
+**Why these services.** Results go to S3 because they are append-only and S3
+objects are immutable — each run writes a new object under a Hive-style
+partition, so Athena can query the bucket with no transformation step. State
+goes to DynamoDB because it is a small read-modify-write per company that needs
+consistency between the read and the write. The single `pk`/`sk` table on
+PAY_PER_REQUEST matches what [`platform/`](platform/README.md) already uses.
+
+**Choices that are load-bearing, not defaults:**
+
+- **Reserved concurrency is 1.** Two runs would race the DynamoDB
+  read-modify-write on the same company and one dedupe ring would be lost.
+- **The bucket and table are `Retain`.** Recent search reaches back 7 days, so
+  deleted history is permanently gone, not re-runnable.
+- **The token is a Secrets Manager ARN, not a template parameter.** A `NoEcho`
+  parameter is redacted in the console but still travels through
+  CloudFormation.
+- **`NoPostsAlarm` treats missing data as breaching.** It watches for *zero
+  kept posts across all companies* — the failure this scraper is most exposed
+  to is the query quietly ceasing to match while invocations stay green.
+  Metrics stopping entirely is the symptom, so missing data has to fire.
+
+**Changing the company list without redeploying:** upload your YAML and set
+`ConfigS3Uri` to its `s3://` URI. The bundled copy is the fallback.
+
+**Scraping one company on demand:** `aws lambda invoke` with
+`{"companies": ["Rivian"]}`.
+
 ### Tests
 
 ```bash
@@ -237,9 +294,21 @@ pip install -r requirements-dev.txt
 python -m pytest tests/
 ```
 
-No network: the HTTP transport is faked, everything below it is the real code
-path. `tests/test_e2e.py` drives the actual CLI through config parsing,
-filtering, scoring, JSONL output and resume-across-runs.
+No network and no AWS account needed. The HTTP transport to X is faked;
+everything below it is the real code path. The AWS backends run against
+[moto](https://github.com/getmoto/moto)'s emulated S3, DynamoDB and Secrets
+Manager rather than stubs — the behaviour worth testing there is the services'
+own, and a stub would only encode assumptions about it.
+
+- `tests/test_e2e.py` drives the CLI through config parsing, filtering,
+  scoring, JSONL output and resume-across-runs.
+- `tests/test_handler.py` drives the Lambda on emulated AWS, including the
+  timeout and partial-failure paths.
+- `tests/test_infra.py` reads the SAM template and asserts it agrees with the
+  code — every env var the handler requires is supplied, the alarm names a
+  metric the handler actually emits, `deploy.sh` stages the directory
+  `CodeUri` points at. These drift silently otherwise: rename a variable and
+  the stack still deploys, still runs on schedule, and fails at 3am.
 
 ## Notes / limitations
 

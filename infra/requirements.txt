@@ -1,0 +1,6 @@
+# Runtime dependencies for the scraper Lambda.
+# boto3/botocore are provided by the python3.12 runtime — bundling them only
+# makes the package bigger and pins a version AWS will move underneath you.
+requests>=2.31.0
+PyYAML>=6.0
+vaderSentiment>=3.3.2
