@@ -14,6 +14,14 @@ ROLE=apply-watcher-role
 RULE=apply-watcher-every-5min
 STATE_PARAM=/apply-watcher/state
 
+# Not the 128 MB default. A watch run alone already pegs 128 MB (the boards
+# are ~700 postings held in memory), and the iMessage path then loads
+# @grpc/grpc-js on top of that — so the function OOMs precisely when it has an
+# alert to send, and dies before logging anything. Lambda also scales CPU with
+# memory, so 512 MB runs ~4x faster; the GB-second cost is roughly a wash and
+# stays far inside the free tier either way.
+MEMORY=${MEMORY:-512}
+
 [ -f .env ] || { echo "Missing aws/.env — copy .env.example and fill it in."; exit 1; }
 set -a; source .env; set +a
 : "${PROJECT_ID:?}" "${PROJECT_SECRET:?}" "${RECIPIENTS:?}"
@@ -74,13 +82,13 @@ if aws lambda get-function --function-name "$FUNC" >/dev/null 2>&1; then
     --zip-file fileb://function.zip >/dev/null
   aws lambda wait function-updated --function-name "$FUNC"
   aws lambda update-function-configuration --function-name "$FUNC" \
-    --environment "$ENV_JSON" --timeout 120 >/dev/null
+    --environment "$ENV_JSON" --timeout 120 --memory-size "$MEMORY" >/dev/null
 else
   aws lambda create-function --function-name "$FUNC" \
     --runtime nodejs22.x --handler index.handler \
     --role "arn:aws:iam::$ACCOUNT:role/$ROLE" \
     --zip-file fileb://function.zip \
-    --environment "$ENV_JSON" --timeout 120 >/dev/null
+    --environment "$ENV_JSON" --timeout 120 --memory-size "$MEMORY" >/dev/null
 fi
 aws lambda wait function-updated --function-name "$FUNC"
 # Cost guardrail: bounded concurrency, and logs expire.
