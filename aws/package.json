@@ -4,6 +4,7 @@
   "type": "module",
   "dependencies": {
     "@grpc/grpc-js": "^1.14.4",
+    "@spectrum-ts/core": "12.2.0",
     "@spectrum-ts/imessage": "12.2.0",
     "nice-grpc": "^2.1.17",
     "nice-grpc-common": "^2.0.4",
