@@ -158,10 +158,19 @@ def load_config(path: str | Path) -> ScrapeConfig:
     path = Path(path)
     if not path.exists():
         raise ConfigError(f"config file not found: {path}")
+    return parse_config(path.read_text(encoding="utf-8"), source=str(path))
 
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+def parse_config(text: str, source: str = "<config>") -> ScrapeConfig:
+    """Validate companies YAML that's already in memory.
+
+    Split out from :func:`load_config` so the Lambda can pull its config from
+    S3 — changing the watched companies shouldn't need a redeploy.
+    """
+    raw = yaml.safe_load(text) or {}
     if not isinstance(raw, dict):
-        raise ConfigError(f"{path}: top level must be a mapping")
+        raise ConfigError(f"{source}: top level must be a mapping")
+    path = source
 
     defaults = raw.get("defaults") or {}
     if not isinstance(defaults, dict):
