@@ -1,0 +1,48 @@
+# Companies to watch on X, for twitter_sentiment.
+#
+#   cp companies.example.yaml companies.yaml
+#   python -m twitter_sentiment --config companies.yaml --dry-run   # check queries
+#   python -m twitter_sentiment --config companies.yaml
+#
+# `terms` are OR'd into the search query AND re-checked locally with word
+# boundaries, so a term is both what gets fetched and what counts as a mention.
+# `exclude_terms` are negated in the query and re-checked the same way.
+
+output_path: sentiment.jsonl      # append-only log of every scored post
+state_path: sentiment_state.json  # since_id high-water marks + dedupe ring
+
+defaults:
+  lang: en              # VADER is English-only; other languages are skipped
+  exclude_retweets: true
+  exclude_replies: false
+  max_results: 100      # posts per page (API allows 10-100)
+  max_pages: 3          # pages per company per run
+
+# Optional: extend the sentiment lexicon for your own domain.
+# Single words use VADER's -4.0..+4.0 valence scale.
+extra_lexicon:
+  vaporware: -2.5
+# Multi-word terms go here instead — VADER scores whitespace tokens, so
+# phrases only work through this list.
+extra_phrases:
+  supply chain delay: -2.0
+
+companies:
+  - name: Tesla
+    terms: [tesla, $TSLA, "#tesla"]
+    exclude_terms: ["nikola tesla", teslacoil]
+
+  - name: Rivian
+    terms: [rivian, $RIVN]
+
+  - name: Boston Dynamics
+    terms: ["boston dynamics", "#BostonDynamics"]
+
+  - name: Figure AI
+    terms: ["figure ai", "figure robotics"]
+    # "figure" alone is hopeless as a term — always pair it.
+
+  - name: Anduril
+    terms: [anduril]
+    # Tolkien references are rare enough not to need an exclude here, but this
+    # is where they would go if volume gets noisy.
