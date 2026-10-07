@@ -68,7 +68,20 @@ type State = {
   notified: string[];
   titles?: Record<string, string>;
   origins?: Record<string, string>;
+  // url -> consecutive runs its (fully answered) board didn't list it.
+  misses?: Record<string, number>;
+  // normalized title -> ms of its last "closed" alert.
+  closedAt?: Record<string, number>;
 };
+
+// amazon.jobs is read through two capped, sort=recent windows, so a posting
+// near the edge drops in and out of the results between runs. Without these
+// guards each flicker sent a "closed" alert and the next run a fresh "LIVE"
+// alert for the same title, every 5 minutes. A posting must now be missing
+// for several runs in a row before it counts as closed, and a title that
+// already had a closed alert re-opens and re-closes silently for a week.
+const MISS_THRESHOLD = 3;
+const REALERT_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000;
 
 const NOTION: Company = { name: "Notion", provider: "ashby", slug: "notion" };
 
@@ -266,6 +279,10 @@ async function loadParam(param: string): Promise<string | null> {
 async function saveParam(param: string, value: string): Promise<void> {
   await ssm.send(new PutParameterCommand({
     Name: param, Value: value, Type: "String", Overwrite: true,
+    // Standard parameters cap at 4 KB; the state outgrows that once enough
+    // postings are tracked, and a failed save meant the next run re-sent
+    // every alert. Intelligent-Tiering moves to Advanced (8 KB) as needed.
+    Tier: "Intelligent-Tiering",
   }));
 }
 
@@ -467,9 +484,16 @@ async function runWatch(): Promise<Record<string, Status>> {
   const pattern = process.env.TITLE_PATTERN
     ? new RegExp(process.env.TITLE_PATTERN, "i")
     : null;
+  const now = Date.now();
+  state.closedAt ??= {};
+  for (const [norm, t] of Object.entries(state.closedAt)) {
+    if (now - t > REALERT_COOLDOWN_MS) delete state.closedAt[norm];
+  }
+  const recentlyClosed = (norm: string) => norm in state.closedAt!;
   if (pattern && combined.size > 0) {
     state.titles ??= {};
     state.origins ??= {};
+    state.misses ??= {};
     for (const job of combined.values()) {
       if (!pattern.test(job.title)) continue;
       const norm = titleKey(job.company, job.title);
@@ -478,12 +502,17 @@ async function runWatch(): Promise<Record<string, Status>> {
       results[job.title] = "live";
       state.titles[job.jobUrl] = job.title;
       state.origins[job.jobUrl] = job.company;
+      delete state.misses[job.jobUrl];
       // Migrate pre-dedupe per-URL marks so those postings don't re-alert.
       if (state.notified.includes(`live:${job.jobUrl}`)) {
         state.notified = state.notified.filter(k => k !== `live:${job.jobUrl}`);
         if (!state.notified.includes(keyLive)) state.notified.push(keyLive);
       }
-      if (!state.notified.includes(keyLive)) {
+      if (!state.notified.includes(keyLive) && recentlyClosed(norm)) {
+        // Re-listed shortly after a closed alert: almost always the Amazon
+        // window flicker, not a real repost. Track it, don't text it.
+        state.notified.push(keyLive);
+      } else if (!state.notified.includes(keyLive)) {
         alerts.push(
           `🚨 ${job.company} posting is LIVE: ${job.title}` +
           (job.location ? ` (${job.location})` : "") +
@@ -508,6 +537,7 @@ async function runWatch(): Promise<Record<string, Status>> {
       const prune = () => {
         delete state.titles![url];
         delete state.origins![url];
+        delete state.misses![url];
         state.notified = state.notified.filter(
           k => k !== `live:${url}` && k !== `gone:${url}`,
         );
@@ -520,6 +550,8 @@ async function runWatch(): Promise<Record<string, Status>> {
       }
       if (liveUrls.has(url) || urls.includes(url)) continue;
       if (okByCompany.get(origin) !== true) continue;
+      state.misses![url] = (state.misses![url] ?? 0) + 1;
+      if (state.misses![url]! < MISS_THRESHOLD) continue;
       // This id is gone either way; only alert if no other live posting
       // still carries the same title (repost/duplicate ids).
       prune();
@@ -529,7 +561,10 @@ async function runWatch(): Promise<Record<string, Status>> {
       const keyLive = `live:${norm}`;
       const keyGone = `gone:${norm}`;
       if (state.notified.includes(keyLive) && !state.notified.includes(keyGone)) {
-        alerts.push(`${origin} posting closed (unlisted): ${title}\n${url}`);
+        if (!recentlyClosed(norm)) {
+          alerts.push(`${origin} posting closed (unlisted): ${title}\n${url}`);
+          state.closedAt![norm] = now;
+        }
         state.notified.push(keyGone);
         state.notified = state.notified.filter(k => k !== keyLive);
       }
@@ -539,6 +574,10 @@ async function runWatch(): Promise<Record<string, Status>> {
       `of ${combined.size} across ${names.length} companies`);
   }
 
+  // Persist BEFORE sending. Saving after meant any save failure (or a crash
+  // mid-send, which EventBridge then retries) re-sent the same alerts on
+  // every run. A lost alert is better than an endless stream of them.
+  await saveParam(param, JSON.stringify(state));
   if (alerts.length > 0) {
     await emailAlerts(alerts);
     await sendAlerts(alerts);
@@ -549,7 +588,6 @@ async function runWatch(): Promise<Record<string, Status>> {
     // Photon being down must not fail the watch run — the notes stay queued.
     console.error(`flush admin notes FAILED — ${e}`);
   }
-  await saveParam(param, JSON.stringify(state));
   console.log(JSON.stringify(results));
   return results;
 }
