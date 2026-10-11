@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "vibecode-visual": {
+      "type": "http",
+      "url": "https://vibecode-visual-design.vercel.app/mcp",
+      "headers": {
+        "Authorization": "Bearer ${VIBECODE_TOKEN}"
+      }
+    }
+  }
+}
